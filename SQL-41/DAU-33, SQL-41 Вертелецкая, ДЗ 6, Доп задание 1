@@ -1,0 +1,79 @@
+1. ЗАПРОС ДЛЯ АНАЛИЗА С САЙТА НЕТОЛОГИИ:
+
+explain analyze --8600.22
+select distinct cu.first_name  || ' ' || cu.last_name as name, 
+	count(ren.iid) over (partition by cu.customer_id)
+from customer cu
+full outer join 
+	(select *, r.inventory_id as iid, inv.sf_string as sfs, r.customer_id as cid
+	from rental r 
+	full outer join 
+		(select *, unnest(f.special_features) as sf_string
+		from inventory i
+		full outer join film f on f.film_id = i.film_id) as inv 
+		on r.inventory_id = inv.inventory_id) as ren 
+	on ren.cid = cu.customer_id 
+where ren.sfs like '%Behind the Scenes%'
+order by count desc
+
+2. ПРОБЛЕМНЫЕ МЕСТА ЗАПРОСА:
+- Hash Right Join -- cost=8212.07..8582.70
+- Nested Loop Left Join -- cost=8212.35..8596.30 
+- Sort (by cu.customer_id) -- cost=8597.57..8597.69
+- WindowAgg  -- cost=8597.57..8598.61
+- Sort (by (count(r.inventory_id) OVER (?)) DESC,((((cu.first_name)::text || ' '::text) || (cu.last_name)::text))) -- cost=8599.88..8599.99
+
+3. МОЙ ЗАПРОС:
+
+select customer_id , count(rental_id) film_count
+from (select f.film_id, title, special_features, r.customer_id, r.rental_id 
+	from film f
+	join inventory i on f.film_id = i.film_id 
+	join rental r on i.inventory_id = r.inventory_id 
+	where special_features && array['Behind the Scenes']
+) t
+group by 1
+order by 1;
+
+4.1 ПЛАН ЗАПРОСА:
+
+Sort  (cost=673.78 ..675.28 rows=599 width=10) (actual time=9.658..9.685 rows=599 loops=1)
+  Sort Key: r.customer_id
+  Sort Method: quicksort  Memory: 53kB
+  ->  HashAggregate  (cost=640.16..646.15 rows=599 width=10) (actual time=9.458..9.543 rows=599 loops=1)
+        Group Key: r.customer_id
+        ->  Hash Join  (cost=202.27..597.17 rows=8598 width=6) (actual time=1.410..8.012 rows=8608 loops=1)
+              Hash Cond: (i.film_id = f.film_id)
+              ->  Hash Join  (cost=128.07..480.67 rows=16044 width=8) (actual time=0.954..5.428 rows=16044 loops=1)
+                    Hash Cond: (r.inventory_id = i.inventory_id)
+                    ->  Seq Scan on rental r  (cost=0.00..310.44 rows=16044 width=10) (actual time=0.003..1.208 rows=16044 loops=1)
+                    ->  Hash  (cost=70.81..70.81 rows=4581 width=6) (actual time=0.942..0.942 rows=4581 loops=1)
+                          Buckets: 8192  Batches: 1  Memory Usage: 243kB
+                          ->  Seq Scan on inventory i  (cost=0.00..70.81 rows=4581 width=6) (actual time=0.004..0.472 rows=4581 loops=1)
+              ->  Hash  (cost=67.50..67.50 rows=536 width=4) (actual time=0.450..0.450 rows=538 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 27kB
+                    ->  Seq Scan on film f  (cost=0.00..67.50 rows=536 width=4) (actual time=0.006..0.388 rows=538 loops=1)
+                          Filter: (special_features && '{"Behind the Scenes"}'::text[])
+                          Rows Removed by Filter: 462
+Planning time: 0.384 ms
+Execution time: 9.756 ms
+
+4.2 ОПИСАНИЕ ПЛАНА ЗАПРОСА:
+
+1) Сканируются таблицы inventory и rental. Сканируюся записи из inventory для обогащения данных таблицы rental. 
+2) Идёт обогащение данных таблицы rental данными из таблицы inventory по типу inner join. Сканируется таблица film. Сканируюся записи из film для обогащения данных.
+3) Ранее обогащеённые данные из таблиц rental, inventory дополнительно обогащаются данными из таблицы film.
+4) Данные группируются по ключу r.customer_id
+5) Данные сортируются по ключу r.customer_id, 
+затраты на получение первой строки - 673.78 ..
+затраты на получение всех строк - 675.28 
+количество возвращаемых строк = 599 
+средний размер одной строки в байтах =10
+реальное время в миллисекундах, затраченное для получения первой строки =9.658..
+реальное время в миллисекундах, затраченное для получения всех строк 9.685 
+реальное количество строк =599 
+сколько раз пришлось выполнить операцию = 1
+
+Итого время планирования 0.384 ms
+Итого время выполнения 9.756 ms
+
